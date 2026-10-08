@@ -1261,7 +1261,8 @@
         "config/eslint/eslint.seatbelt.tsv",
         "tests/unit/BankAccountUtilsTest.ts",
         "tests/unit/__snapshots__/ReportAlternateTextParityTest.ts.snap",
-        "evals/proposalPolice/fixtures/**"
+        "evals/proposalPolice/fixtures/**",
+        "artifacts/**"
     ],
     "ignoreRegExpList": ["@assets/.*", "(?<![A-Za-z0-9+/])(?:sha256/)?[A-Za-z0-9+/]{43}="],
     "useGitignore": true

@@ -3744,8 +3744,11 @@ describe('actions/Report', () => {
             );
             await Onyx.mergeCollection(ONYXKEYS.COLLECTION.REPORT, reportCollections);
 
-            // When mark all reports as read
-            markAllMessagesAsRead(undefined, undefined, undefined);
+            // When the unread report ids are marked read. The action no longer scans Onyx when ids are omitted.
+            const unreadReportIDs = Object.values(reportCollections)
+                .filter((report) => !!report.lastMessageText)
+                .map((report) => report.reportID);
+            markAllMessagesAsRead(undefined, unreadReportIDs);
 
             await waitForBatchedUpdates();
 
@@ -3803,7 +3806,7 @@ describe('actions/Report', () => {
             await waitForBatchedUpdates();
 
             // When the Inbox passes that parent id (the Unread-tab selection) instead of letting the action scan Onyx again
-            markAllMessagesAsRead(undefined, [parentID], undefined);
+            markAllMessagesAsRead(undefined, [parentID]);
             await waitForBatchedUpdates();
 
             // Then the batch includes the parent and its lastReadTime moves forward, because the passed ids are authoritative
@@ -3842,7 +3845,7 @@ describe('actions/Report', () => {
             await waitForBatchedUpdates();
 
             // When no ids are passed (today's All/Unread caller)
-            markAllMessagesAsRead(undefined, undefined, undefined);
+            markAllMessagesAsRead(undefined, undefined);
             await waitForBatchedUpdates();
 
             // Then the muted report is left alone. An omitted list must not become every unread report in Onyx.
@@ -3851,12 +3854,17 @@ describe('actions/Report', () => {
             expect(apiWriteSpy.mock.calls.some((call) => call.at(0) === WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ)).toBe(false);
 
             // When the Inbox passes only the id the Unread tab would show
-            markAllMessagesAsRead(undefined, [reportAID], undefined);
+            markAllMessagesAsRead(undefined, [reportAID]);
             await waitForBatchedUpdates();
 
             // Then the batch is exactly that id and the muted report is still untouched
-            const parameters = getMarkAllWriteCall()?.at(1) as {reportIDList?: string[]} | undefined;
-            expect(parameters?.reportIDList).toEqual([reportAID]);
+            expect(apiWriteSpy).toHaveBeenCalledWith(
+                WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ,
+                expect.objectContaining({
+                    reportIDList: [reportAID],
+                }),
+                expect.anything(),
+            );
             const mutedReportAfter = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`);
             expect(mutedReportAfter?.lastReadTime).toBe(older);
         });
@@ -3881,13 +3889,18 @@ describe('actions/Report', () => {
             await waitForBatchedUpdates();
 
             // When both ids are marked together
-            markAllMessagesAsRead(undefined, [reportAID, reportBID], undefined);
+            markAllMessagesAsRead(undefined, [reportAID, reportBID]);
             await waitForBatchedUpdates();
 
             // Then the shared lastReadTime is the newest server stamp, not now plus the skew, and both chats read as read
-            const parameters = getMarkAllWriteCall()?.at(1) as {lastReadTime?: string; reportIDList?: string[]} | undefined;
-            expect(parameters?.lastReadTime).toBe(mentionedTime);
-            expect([...(parameters?.reportIDList ?? [])].sort()).toEqual([reportAID, reportBID].sort());
+            expect(apiWriteSpy).toHaveBeenCalledWith(
+                WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ,
+                expect.objectContaining({
+                    lastReadTime: mentionedTime,
+                    reportIDList: [reportAID, reportBID],
+                }),
+                expect.anything(),
+            );
             const reportA = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportAID}`);
             const reportB = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`);
             expect(ReportUtils.isUnread(reportA, undefined, undefined, undefined)).toBe(false);
@@ -3912,7 +3925,7 @@ describe('actions/Report', () => {
 
             try {
                 // When the report is marked read and the request has not finished yet
-                markAllMessagesAsRead(undefined, [reportID], undefined);
+                markAllMessagesAsRead(undefined, [reportID]);
                 await waitForBatchedUpdates();
 
                 // Then optimistic data clears the manual anchor (it pins the in-chat New marker) and failure data keeps both previous values
@@ -3943,7 +3956,8 @@ describe('actions/Report', () => {
                 );
 
                 const optimisticReport = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportID}`);
-                expect(optimisticReport?.manuallyMarkedUnreadReportActionID).toBeNull();
+                // Merging null removes the key, so a later read is undefined. Either way the manual anchor no longer pins the New marker.
+                expect(optimisticReport?.manuallyMarkedUnreadReportActionID ?? null).toBeNull();
                 expect(optimisticReport?.lastReadTime).not.toBe(older);
 
                 // When the write fails
@@ -3990,16 +4004,24 @@ describe('actions/Report', () => {
 
             try {
                 // When only the unread ids are passed
-                markAllMessagesAsRead(undefined, [reportAID, reportBID], undefined);
+                markAllMessagesAsRead(undefined, [reportAID, reportBID]);
                 await waitForBatchedUpdates();
 
                 // Then each marked report emits once with the batch lastReadTime, and the already-read report does not
-                const parameters = getMarkAllWriteCall()?.at(1) as {lastReadTime?: string} | undefined;
-                const batchLastReadTime = parameters?.lastReadTime;
+                const markedReport = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportAID}`);
+                const batchLastReadTime = markedReport?.lastReadTime;
                 expect(batchLastReadTime).toBeTruthy();
                 expect(emittedTimes[reportAID]).toEqual([batchLastReadTime]);
                 expect(emittedTimes[reportBID]).toEqual([batchLastReadTime]);
                 expect(emittedTimes[reportCID]).toEqual([]);
+                expect(apiWriteSpy).toHaveBeenCalledWith(
+                    WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ,
+                    expect.objectContaining({
+                        lastReadTime: batchLastReadTime,
+                        reportIDList: [reportAID, reportBID],
+                    }),
+                    expect.anything(),
+                );
             } finally {
                 for (const subscription of subscriptions) {
                     subscription.remove();
