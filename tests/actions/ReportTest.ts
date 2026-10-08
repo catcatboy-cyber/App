@@ -50,6 +50,7 @@ import type {OnyxCollection, OnyxEntry, OnyxUpdate} from 'react-native-onyx';
 
 import {addMinutes, addSeconds, format, subMinutes} from 'date-fns';
 import {toZonedTime} from 'date-fns-tz';
+import {DeviceEventEmitter} from 'react-native';
 import Onyx from 'react-native-onyx';
 import OnyxUtils from 'react-native-onyx/dist/OnyxUtils';
 
@@ -3699,6 +3700,30 @@ describe('actions/Report', () => {
     });
 
     describe('markAllMessagesAsRead', () => {
+        const currentUserAccountID = 1;
+        const otherActorAccountID = 999001;
+
+        beforeEach(async () => {
+            // isUnread() treats the current user's own last action as already read. Pin the session so that guard
+            // stays stable and a different lastActorAccountID still counts as unread.
+            await Onyx.merge(ONYXKEYS.SESSION, {email: 'test@test.com', accountID: currentUserAccountID});
+            // Clearing Onyx does not reset NetworkState's in-memory skew, so start each case from zero.
+            await Onyx.merge(ONYXKEYS.NETWORK, {timeSkew: 0});
+            await waitForBatchedUpdates();
+        });
+
+        const buildUnreadReport = (reportID: string, lastReadTime: string, lastVisibleActionCreated: string, extra?: Partial<OnyxTypes.Report>): OnyxTypes.Report => ({
+            ...createRandomReport(Number(reportID), undefined),
+            reportID,
+            lastMessageText: 'message',
+            lastActorAccountID: otherActorAccountID,
+            lastReadTime,
+            lastVisibleActionCreated,
+            ...extra,
+        });
+
+        const getMarkAllWriteCall = () => apiWriteSpy.mock.calls.find((call) => call.at(0) === WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ);
+
         it('should mark all unread reports as read', async () => {
             // Given a collection of 10 unread and read reports, where even-index report is unread
             const currentTime = DateUtils.getDBTime();
@@ -3739,6 +3764,247 @@ describe('actions/Report', () => {
                 }),
             );
             expect(isUnreadCollection.some(Boolean)).toBe(false);
+        });
+
+        it('should include every passed reportID even when isUnread(report, thread) is false', async () => {
+            // Given a one-expense parent the Unread tab would list (isUnread with no thread is true) whose transaction
+            // thread is already read. Main's second isUnread(report, thread) skips that parent, so the id the tab showed is dropped.
+            const currentTime = DateUtils.getDBTime();
+            const older = DateUtils.subtractMillisecondsFromDateTime(currentTime, 60000);
+            const parentID = '10168401';
+            const threadID = '10168402';
+            const iouAction: OnyxTypes.ReportAction<typeof CONST.REPORT.ACTIONS.TYPE.IOU> = {
+                reportActionID: '101684-iou',
+                actionName: CONST.REPORT.ACTIONS.TYPE.IOU,
+                created: currentTime,
+                message: [{type: 'COMMENT', html: 'Expense', text: 'Expense'}],
+                originalMessage: {
+                    amount: 100,
+                    currency: CONST.CURRENCY.USD,
+                    IOUTransactionID: 'txn-101684',
+                    type: CONST.IOU.REPORT_ACTION_TYPE.CREATE,
+                },
+                childReportID: threadID,
+            };
+
+            await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT}${parentID}`, {
+                ...buildUnreadReport(parentID, older, currentTime),
+                type: CONST.REPORT.TYPE.EXPENSE,
+                lastMessageText: 'expense',
+            });
+            await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT}${threadID}`, {
+                ...buildUnreadReport(threadID, currentTime, currentTime),
+                parentReportID: parentID,
+                lastMessageText: 'thread',
+            });
+            await Onyx.merge(`${ONYXKEYS.COLLECTION.REPORT_ACTIONS}${parentID}`, {
+                [iouAction.reportActionID]: iouAction,
+            });
+            await waitForBatchedUpdates();
+
+            // When the Inbox passes that parent id (the Unread-tab selection) instead of letting the action scan Onyx again
+            markAllMessagesAsRead(undefined, [parentID], undefined);
+            await waitForBatchedUpdates();
+
+            // Then the batch includes the parent and its lastReadTime moves forward, because the passed ids are authoritative
+            expect(apiWriteSpy).toHaveBeenCalledWith(
+                WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ,
+                expect.objectContaining({
+                    reportIDList: expect.arrayContaining([parentID]),
+                }),
+                expect.anything(),
+            );
+            const parent = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${parentID}`);
+            expect(parent?.lastReadTime).not.toBe(older);
+        });
+
+        it('should mark only the provided reportIDs and ignore other unread reports in Onyx', async () => {
+            // Given two unread chats. B is muted, so the Unread tab would not list it, but it still sits in Onyx.
+            // Main marks every isUnread report when reportIDs is omitted; the action must not scan Onyx in that case.
+            const currentTime = DateUtils.getDBTime();
+            const older = DateUtils.subtractMillisecondsFromDateTime(currentTime, 60000);
+            const reportAID = '10168441';
+            const reportBID = '10168442';
+            await Onyx.mergeCollection(ONYXKEYS.COLLECTION.REPORT, {
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportAID}`]: {
+                    ...buildUnreadReport(reportAID, older, currentTime),
+                    participants: {
+                        [currentUserAccountID]: {notificationPreference: CONST.REPORT.NOTIFICATION_PREFERENCE.ALWAYS},
+                    },
+                },
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`]: {
+                    ...buildUnreadReport(reportBID, older, currentTime),
+                    participants: {
+                        [currentUserAccountID]: {notificationPreference: CONST.REPORT.NOTIFICATION_PREFERENCE.MUTE},
+                    },
+                },
+            });
+            await waitForBatchedUpdates();
+
+            // When no ids are passed (today's All/Unread caller)
+            markAllMessagesAsRead(undefined, undefined, undefined);
+            await waitForBatchedUpdates();
+
+            // Then the muted report is left alone. An omitted list must not become every unread report in Onyx.
+            const mutedReport = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`);
+            expect(mutedReport?.lastReadTime).toBe(older);
+            expect(apiWriteSpy.mock.calls.some((call) => call.at(0) === WRITE_COMMANDS.MARK_ALL_MESSAGES_AS_READ)).toBe(false);
+
+            // When the Inbox passes only the id the Unread tab would show
+            markAllMessagesAsRead(undefined, [reportAID], undefined);
+            await waitForBatchedUpdates();
+
+            // Then the batch is exactly that id and the muted report is still untouched
+            const parameters = getMarkAllWriteCall()?.at(1) as {reportIDList?: string[]} | undefined;
+            expect(parameters?.reportIDList).toEqual([reportAID]);
+            const mutedReportAfter = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`);
+            expect(mutedReportAfter?.lastReadTime).toBe(older);
+        });
+
+        it('should send newest server-stamped lastReadTime, not skewed client clock', async () => {
+            // Given the client clock is 10 minutes ahead and two unread reports carry server timestamps, one newer via a mention
+            await Onyx.merge(ONYXKEYS.NETWORK, {timeSkew: 10 * 60 * 1000});
+            await waitForBatchedUpdates();
+
+            const visibleTime = '2026-10-07 12:00:00.000';
+            const mentionedTime = '2026-10-07 12:05:00.000';
+            const older = '2026-10-07 11:00:00.000';
+            const reportAID = '10168411';
+            const reportBID = '10168412';
+            await Onyx.mergeCollection(ONYXKEYS.COLLECTION.REPORT, {
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportAID}`]: buildUnreadReport(reportAID, older, visibleTime),
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`]: {
+                    ...buildUnreadReport(reportBID, older, visibleTime),
+                    lastMentionedTime: mentionedTime,
+                },
+            });
+            await waitForBatchedUpdates();
+
+            // When both ids are marked together
+            markAllMessagesAsRead(undefined, [reportAID, reportBID], undefined);
+            await waitForBatchedUpdates();
+
+            // Then the shared lastReadTime is the newest server stamp, not now plus the skew, and both chats read as read
+            const parameters = getMarkAllWriteCall()?.at(1) as {lastReadTime?: string; reportIDList?: string[]} | undefined;
+            expect(parameters?.lastReadTime).toBe(mentionedTime);
+            expect([...(parameters?.reportIDList ?? [])].sort()).toEqual([reportAID, reportBID].sort());
+            const reportA = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportAID}`);
+            const reportB = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`);
+            expect(ReportUtils.isUnread(reportA, undefined, undefined, undefined)).toBe(false);
+            expect(ReportUtils.isUnread(reportB, undefined, undefined, undefined)).toBe(false);
+        });
+
+        it('should clear manuallyMarkedUnreadReportActionID and restore it when the write fails', async () => {
+            // Given an unread report pinned to a manual unread action, and the write will be rejected
+            const mockFetch = TestHelper.createGlobalFetchMock();
+            global.fetch = mockFetch;
+            mockFetch.pause();
+
+            const currentTime = DateUtils.getDBTime();
+            const older = DateUtils.subtractMillisecondsFromDateTime(currentTime, 60000);
+            const reportID = '10168421';
+            const manualActionID = 'manual-action-1';
+            await Onyx.set(`${ONYXKEYS.COLLECTION.REPORT}${reportID}`, {
+                ...buildUnreadReport(reportID, older, currentTime),
+                manuallyMarkedUnreadReportActionID: manualActionID,
+            });
+            await waitForBatchedUpdates();
+
+            try {
+                // When the report is marked read and the request has not finished yet
+                markAllMessagesAsRead(undefined, [reportID], undefined);
+                await waitForBatchedUpdates();
+
+                // Then optimistic data clears the manual anchor (it pins the in-chat New marker) and failure data keeps both previous values
+                const writeCall = getMarkAllWriteCall();
+                const reportKey = `${ONYXKEYS.COLLECTION.REPORT}${reportID}`;
+                expect(writeCall?.at(2)).toEqual(
+                    expect.objectContaining({
+                        optimisticData: expect.arrayContaining([
+                            expect.objectContaining({
+                                value: expect.objectContaining({
+                                    [reportKey]: expect.objectContaining({
+                                        manuallyMarkedUnreadReportActionID: null,
+                                    }),
+                                }),
+                            }),
+                        ]),
+                        failureData: expect.arrayContaining([
+                            expect.objectContaining({
+                                value: expect.objectContaining({
+                                    [reportKey]: expect.objectContaining({
+                                        lastReadTime: older,
+                                        manuallyMarkedUnreadReportActionID: manualActionID,
+                                    }),
+                                }),
+                            }),
+                        ]),
+                    }),
+                );
+
+                const optimisticReport = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportID}`);
+                expect(optimisticReport?.manuallyMarkedUnreadReportActionID).toBeNull();
+                expect(optimisticReport?.lastReadTime).not.toBe(older);
+
+                // When the write fails
+                mockFetch.fail();
+                await mockFetch.resume();
+                await waitForBatchedUpdates();
+                await waitForNetworkPromises();
+                await waitForBatchedUpdates();
+
+                // Then both the previous lastReadTime and the manual anchor are restored
+                const restoredReport = await getOnyxValue(`${ONYXKEYS.COLLECTION.REPORT}${reportID}`);
+                expect(restoredReport?.lastReadTime).toBe(older);
+                expect(restoredReport?.manuallyMarkedUnreadReportActionID).toBe(manualActionID);
+            } finally {
+                await mockFetch.resume();
+                mockFetch.mockReset();
+            }
+        });
+
+        it('should emit readNewestAction for each marked reportID with the new watermark', async () => {
+            // Given two unread reports and one that is already read. A mounted chat only moves its New marker on readNewestAction_<reportID>.
+            const currentTime = DateUtils.getDBTime();
+            const older = DateUtils.subtractMillisecondsFromDateTime(currentTime, 60000);
+            const reportAID = '10168431';
+            const reportBID = '10168432';
+            const reportCID = '10168433';
+            const emittedTimes: Record<string, string[]> = {
+                [reportAID]: [],
+                [reportBID]: [],
+                [reportCID]: [],
+            };
+            const subscriptions = [reportAID, reportBID, reportCID].map((reportID) =>
+                DeviceEventEmitter.addListener(`readNewestAction_${reportID}`, (lastReadTime: string) => {
+                    emittedTimes[reportID].push(lastReadTime);
+                }),
+            );
+
+            await Onyx.mergeCollection(ONYXKEYS.COLLECTION.REPORT, {
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportAID}`]: buildUnreadReport(reportAID, older, currentTime),
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportBID}`]: buildUnreadReport(reportBID, older, currentTime),
+                [`${ONYXKEYS.COLLECTION.REPORT}${reportCID}`]: buildUnreadReport(reportCID, currentTime, currentTime),
+            });
+            await waitForBatchedUpdates();
+
+            try {
+                // When only the unread ids are passed
+                markAllMessagesAsRead(undefined, [reportAID, reportBID], undefined);
+                await waitForBatchedUpdates();
+
+                // Then each marked report emits once with the batch lastReadTime, and the already-read report does not
+                const parameters = getMarkAllWriteCall()?.at(1) as {lastReadTime?: string} | undefined;
+                const batchLastReadTime = parameters?.lastReadTime;
+                expect(batchLastReadTime).toBeTruthy();
+                expect(emittedTimes[reportAID]).toEqual([batchLastReadTime]);
+                expect(emittedTimes[reportBID]).toEqual([batchLastReadTime]);
+                expect(emittedTimes[reportCID]).toEqual([]);
+            } finally {
+                for (const subscription of subscriptions) {
+                    subscription.remove();
+                }
+            }
         });
     });
 
